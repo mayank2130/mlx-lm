@@ -157,6 +157,70 @@ class TestProcessControlTokens(unittest.TestCase):
         )
 
 
+class TestDiffusionResponseParsing(unittest.TestCase):
+    class FakeTokenizer:
+        has_thinking = True
+        has_tool_calling = True
+        think_start = "<think>"
+        think_end = "</think>"
+        tool_call_start = "<tool_call>"
+        tool_call_end = "</tool_call>"
+
+    def test_diffusion_plain_text_stays_normal(self):
+        responses = ResponseGenerator._diffusion_responses_from_text(
+            self.FakeTokenizer(), "hello world"
+        )
+
+        self.assertEqual(len(responses), 1)
+        self.assertEqual(responses[0].state, "normal")
+        self.assertEqual(responses[0].text, "hello world")
+        self.assertEqual(responses[0].finish_reason, "stop")
+
+    def test_diffusion_text_splits_tool_call_segments(self):
+        responses = ResponseGenerator._diffusion_responses_from_text(
+            self.FakeTokenizer(),
+            'hi <tool_call>{"name":"weather","arguments":{"city":"Boston"}}</tool_call> bye',
+        )
+
+        self.assertEqual(
+            [(r.state, r.text) for r in responses],
+            [
+                ("normal", "hi "),
+                ("tool", '{"name":"weather","arguments":{"city":"Boston"}}'),
+                ("normal", " bye"),
+            ],
+        )
+        self.assertEqual(responses[-1].finish_reason, "tool_calls")
+
+    def test_diffusion_text_preserves_back_to_back_tool_boundaries(self):
+        responses = ResponseGenerator._diffusion_responses_from_text(
+            self.FakeTokenizer(),
+            "<tool_call>call1</tool_call><tool_call>call2</tool_call>",
+        )
+
+        self.assertEqual(
+            [(r.state, r.text) for r in responses],
+            [
+                ("tool", "call1"),
+                ("normal", ""),
+                ("tool", "call2"),
+            ],
+        )
+        self.assertEqual(responses[-1].finish_reason, "tool_calls")
+
+    def test_diffusion_text_preserves_reasoning_segments(self):
+        responses = ResponseGenerator._diffusion_responses_from_text(
+            self.FakeTokenizer(),
+            "<think>reason</think>answer",
+        )
+
+        self.assertEqual(
+            [(r.state, r.text) for r in responses],
+            [("reasoning", "reason"), ("normal", "answer")],
+        )
+        self.assertEqual(responses[-1].finish_reason, "stop")
+
+
 class TestServer(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

@@ -26,6 +26,7 @@ import mlx.nn as nn
 from mlx.utils import tree_reduce
 from transformers import PreTrainedTokenizer
 
+from .diffusion_generate import llada_generate
 from .models import cache
 from .models.cache import (
     ArraysCache,
@@ -218,6 +219,81 @@ def setup_arg_parser():
         type=int,
         help="Number of tokens to draft when using speculative decoding.",
         default=3,
+    )
+    parser.add_argument(
+        "--diffusion-mode",
+        type=str,
+        default="faithful_llada",
+        choices=[
+            "faithful_llada",
+            "experimental_block_local",
+            "dynamic_block_diffusion",
+            "fast_dllm_v1",
+            "fast_dllm_v1_dynamic",
+            "fast_dllm_v2",
+        ],
+        help="Diffusion runtime mode.",
+    )
+    parser.add_argument(
+        "--diffusion-steps",
+        type=int,
+        default=0,
+        help="Enable diffusion generation with the given number of refinement steps.",
+    )
+    parser.add_argument(
+        "--diffusion-gen-length",
+        type=int,
+        default=128,
+        help="Generated suffix length for diffusion generation.",
+    )
+    parser.add_argument(
+        "--diffusion-block-length",
+        type=int,
+        default=128,
+        help="Block length for diffusion generation.",
+    )
+    parser.add_argument(
+        "--diffusion-compile-steps",
+        type=str2bool,
+        default=True,
+        help="Compile the diffusion denoise-update kernel.",
+    )
+    parser.add_argument(
+        "--diffusion-block-local",
+        type=str2bool,
+        default=False,
+        help="Use the experimental block-local diffusion runtime.",
+    )
+    parser.add_argument(
+        "--diffusion-dynamic-batching",
+        type=str2bool,
+        default=True,
+        help="Only process active batch rows during diffusion refinement.",
+    )
+    parser.add_argument(
+        "--diffusion-warmup",
+        type=str2bool,
+        default=False,
+        help="Warm up the model with a small diffusion-aware forward pass after load.",
+    )
+    parser.add_argument(
+        "--diffusion-remasking",
+        type=str,
+        choices=["low_confidence", "random"],
+        default="low_confidence",
+        help="Confidence scoring mode for diffusion token transfers.",
+    )
+    parser.add_argument(
+        "--diffusion-threshold",
+        type=float,
+        default=None,
+        help="Confidence threshold for threshold-based parallel decoding.",
+    )
+    parser.add_argument(
+        "--diffusion-factor",
+        type=float,
+        default=None,
+        help="Dynamic transfer factor used by Fast-dLLM-style adaptive decoding.",
     )
     return parser
 
@@ -2010,6 +2086,16 @@ def main():
         adapter_path=args.adapter_path,
         tokenizer_config=tokenizer_config,
         model_config={"quantize_activations": args.quantize_activations},
+        warmup=args.diffusion_warmup,
+        warmup_config=(
+            {
+                "sequence_length": args.diffusion_gen_length + 16,
+                "block_length": min(args.diffusion_block_length, args.diffusion_gen_length),
+                "max_tokens": args.diffusion_gen_length + 16,
+            }
+            if args.diffusion_warmup
+            else None
+        ),
     )
     for eos_token in args.extra_eos_token:
         tokenizer.add_eos_token(eos_token)
@@ -2059,31 +2145,55 @@ def main():
             raise ValueError("Draft model tokenizer does not match model tokenizer.")
     else:
         draft_model = None
-    sampler = make_sampler(
-        args.temp,
-        args.top_p,
-        args.min_p,
-        args.min_tokens_to_keep,
-        top_k=args.top_k,
-        xtc_probability=args.xtc_probability,
-        xtc_threshold=args.xtc_threshold,
-        xtc_special_tokens=tokenizer.encode("\n") + list(tokenizer.eos_token_ids),
-    )
-    response = generate(
-        model,
-        tokenizer,
-        prompt,
-        max_tokens=args.max_tokens,
-        verbose=args.verbose,
-        sampler=sampler,
-        max_kv_size=args.max_kv_size,
-        prompt_cache=prompt_cache if using_cache else None,
-        kv_bits=args.kv_bits,
-        kv_group_size=args.kv_group_size,
-        quantized_kv_start=args.quantized_kv_start,
-        draft_model=draft_model,
-        num_draft_tokens=args.num_draft_tokens,
-    )
+    if args.diffusion_steps > 0:
+        diffusion_result = llada_generate(
+            model,
+            tokenizer,
+            prompt,
+            mode=args.diffusion_mode,
+            steps=args.diffusion_steps,
+            gen_length=args.diffusion_gen_length,
+            block_length=args.diffusion_block_length,
+            temperature=args.temp,
+            remasking=args.diffusion_remasking,
+            threshold=args.diffusion_threshold,
+            factor=args.diffusion_factor,
+            compile_steps=args.diffusion_compile_steps,
+            block_local=args.diffusion_block_local,
+            dynamic_batching=args.diffusion_dynamic_batching,
+            verbose=args.verbose,
+        )
+        response = diffusion_result.text
+        if isinstance(response, list):
+            response = response[0] if len(response) == 1 else "\n".join(response)
+        if args.verbose:
+            print(response, end="" if response.endswith("\n") else "\n")
+    else:
+        sampler = make_sampler(
+            args.temp,
+            args.top_p,
+            args.min_p,
+            args.min_tokens_to_keep,
+            top_k=args.top_k,
+            xtc_probability=args.xtc_probability,
+            xtc_threshold=args.xtc_threshold,
+            xtc_special_tokens=tokenizer.encode("\n") + list(tokenizer.eos_token_ids),
+        )
+        response = generate(
+            model,
+            tokenizer,
+            prompt,
+            max_tokens=args.max_tokens,
+            verbose=args.verbose,
+            sampler=sampler,
+            max_kv_size=args.max_kv_size,
+            prompt_cache=prompt_cache if using_cache else None,
+            kv_bits=args.kv_bits,
+            kv_group_size=args.kv_group_size,
+            quantized_kv_start=args.quantized_kv_start,
+            draft_model=draft_model,
+            num_draft_tokens=args.num_draft_tokens,
+        )
     if not args.verbose:
         print(response)
 

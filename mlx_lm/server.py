@@ -33,6 +33,8 @@ import mlx.core as mx
 from huggingface_hub import scan_cache_dir
 
 from ._version import __version__
+from .diffusion import ContinuousDiffusionBatcher, DiffusionBatchRequest
+from .diffusion_generate import llada_generate, make_llada_runtime
 from .generate import (
     BatchGenerator,
     SequenceStateMachine,
@@ -192,6 +194,7 @@ class GenerationArguments:
     top_logprobs: int
     seed: Optional[int]
     chat_template_kwargs: Optional[Dict[str, Any]]
+    diffusion: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -685,6 +688,162 @@ class ResponseGenerator:
     def _is_batchable(self, args):
         return self.model_provider.is_batchable and args.seed is None
 
+    def _diffusion_signature(self, args):
+        diffusion = args.diffusion or {}
+        gen_length = diffusion.get("gen_length", args.max_tokens)
+        return (
+            args.model,
+            diffusion.get("mode", "faithful_llada"),
+            diffusion.get("steps", args.max_tokens),
+            gen_length,
+            diffusion.get("block_length", gen_length),
+            args.sampling.temperature,
+            diffusion.get("cfg_scale", 0.0),
+            diffusion.get("compile_steps", True),
+            diffusion.get("block_local", False),
+            diffusion.get("dynamic_batching", True),
+        )
+
+    def _make_diffusion_batcher(self, model, args):
+        diffusion = args.diffusion or {}
+        runtime = make_llada_runtime(
+            model,
+            mode=diffusion.get("mode", "faithful_llada"),
+            steps=diffusion.get("steps", args.max_tokens),
+            gen_length=diffusion.get("gen_length", args.max_tokens),
+            block_length=diffusion.get(
+                "block_length", diffusion.get("gen_length", args.max_tokens)
+            ),
+            temperature=args.sampling.temperature,
+            cfg_scale=diffusion.get("cfg_scale", 0.0),
+            compile_steps=diffusion.get("compile_steps", True),
+            block_local=diffusion.get("block_local", False),
+            dynamic_batching=diffusion.get("dynamic_batching", True),
+        )
+        return ContinuousDiffusionBatcher(runtime)
+
+    @staticmethod
+    def _diffusion_response_finish_reason(responses: List[Response]) -> str:
+        made_tool_call = any(r.state == "tool" and r.text for r in responses)
+        return "tool_calls" if made_tool_call else "stop"
+
+    @staticmethod
+    def _diffusion_responses_from_text(tokenizer, text: str) -> List[Response]:
+        """
+        Split a fully generated diffusion string into normal / reasoning / tool
+        segments so the rest of the server can reuse the same response
+        formatting path as autoregressive generation.
+        """
+
+        def marker_positions(pos: int):
+            markers = []
+            if tokenizer.has_thinking:
+                idx = text.find(tokenizer.think_start, pos)
+                if idx >= 0:
+                    markers.append((idx, "reasoning", tokenizer.think_start))
+            if tokenizer.has_tool_calling:
+                idx = text.find(tokenizer.tool_call_start, pos)
+                if idx >= 0:
+                    markers.append((idx, "tool", tokenizer.tool_call_start))
+            return markers
+
+        segments: List[Tuple[str, str]] = []
+        pos = 0
+        state = "normal"
+        just_closed_control = False
+
+        while pos < len(text):
+            if state == "normal":
+                markers = marker_positions(pos)
+                if not markers:
+                    if pos < len(text):
+                        segments.append(("normal", text[pos:]))
+                    break
+
+                next_pos, next_state, marker_text = min(markers, key=lambda m: m[0])
+                if next_pos > pos:
+                    segments.append(("normal", text[pos:next_pos]))
+                    pos = next_pos
+                    just_closed_control = False
+                    continue
+
+                if just_closed_control:
+                    segments.append(("normal", ""))
+                    just_closed_control = False
+                    continue
+
+                pos += len(marker_text)
+                state = next_state
+                continue
+
+            if state == "reasoning":
+                end_marker = tokenizer.think_end
+            else:
+                end_marker = tokenizer.tool_call_end
+
+            if not end_marker:
+                segments.append((state, text[pos:]))
+                pos = len(text)
+                break
+
+            end_pos = text.find(end_marker, pos)
+            if end_pos < 0:
+                segments.append((state, text[pos:]))
+                pos = len(text)
+                break
+
+            segments.append((state, text[pos:end_pos]))
+            pos = end_pos + len(end_marker)
+            state = "normal"
+            just_closed_control = True
+
+        if not segments:
+            segments = [("normal", text)]
+
+        finish_reason = ResponseGenerator._diffusion_response_finish_reason(
+            [Response(s, -1, st, None, 0.0, None, ()) for st, s in segments]
+        )
+        responses = []
+        for i, (segment_state, segment_text) in enumerate(segments):
+            responses.append(
+                Response(
+                    segment_text,
+                    -1,
+                    segment_state,
+                    None,
+                    0.0,
+                    finish_reason if i == len(segments) - 1 else None,
+                    (),
+                )
+            )
+        return responses
+
+    def _emit_diffusion_text(self, rqueue, tokenizer, output_text: str):
+        for response in self._diffusion_responses_from_text(tokenizer, output_text):
+            rqueue.put(response)
+        rqueue.put(None)
+
+    def _enqueue_diffusion_request(self, batcher, batch_results, rqueue, request, args, tokenizer):
+        prompt, _, _, initial_state = self._tokenize(tokenizer, request, args)
+        sm, sequences = self._make_state_machine(
+            self.model_provider.model_key,
+            tokenizer,
+            args.stop_words,
+            initial_state=initial_state,
+        )
+        del sm
+        ctx = GenerationContext(
+            has_tool_calling=tokenizer.has_tool_calling,
+            has_thinking=tokenizer.has_thinking,
+            tool_parser=tokenizer.tool_parser,
+            sequences=sequences,
+            prompt=prompt,
+        )
+        rqueue.put(ctx)
+        uid = str(uuid.uuid4())
+        batcher.enqueue(DiffusionBatchRequest(prompt=prompt, request_id=uid))
+        batch_results[uid] = {"ctx": ctx, "rqueue": rqueue}
+
     def _generate(self):
         # Local thread stream that we 'll pass to the BatchGenerator to make
         # sure that all generation runs in the same stream as the
@@ -701,6 +860,10 @@ class ResponseGenerator:
         batch_generator = None
         drain_batch = False
         batch_results = {}
+        diffusion_batcher = None
+        diffusion_batch_results = {}
+        current_diffusion_signature = None
+        drain_diffusion_batch = False
 
         unprocessed_requests = []
 
@@ -719,7 +882,10 @@ class ResponseGenerator:
             if not drain_batch:
                 timeout = (
                     None
-                    if (batch_generator is not None and len(batch_results) > 0)
+                    if (
+                        (batch_generator is not None and len(batch_results) > 0)
+                        or (diffusion_batcher is not None and len(diffusion_batch_results) > 0)
+                    )
                     else 0.1
                 )
                 request = get_next_request(timeout=timeout)
@@ -727,6 +893,62 @@ class ResponseGenerator:
             # We got a request
             if request is not None:
                 rqueue, request, args = request
+
+                if args.diffusion and args.diffusion.get("enabled", False):
+                    if batch_generator is not None:
+                        drain_batch = True
+                        unprocessed_requests.append((rqueue, request, args))
+                        continue
+
+                    diffusion_signature = self._diffusion_signature(args)
+                    if (
+                        diffusion_batcher is not None
+                        and current_model == args.model
+                        and current_diffusion_signature == diffusion_signature
+                        and self._is_batchable(args)
+                    ):
+                        try:
+                            self._enqueue_diffusion_request(
+                                diffusion_batcher,
+                                diffusion_batch_results,
+                                rqueue,
+                                request,
+                                args,
+                                current_tokenizer,
+                            )
+                        except Exception as e:
+                            rqueue.put(e)
+                        continue
+                    elif diffusion_batcher is None:
+                        try:
+                            model, tokenizer = self.model_provider.load(
+                                args.model.model, args.model.adapter, args.model.draft
+                            )
+                        except Exception as e:
+                            rqueue.put(e)
+                            continue
+
+                        if not self._is_batchable(args):
+                            self._serve_single((rqueue, request, args))
+                            continue
+
+                        current_model = args.model
+                        current_tokenizer = tokenizer
+                        current_model_key = self.model_provider.model_key
+                        current_diffusion_signature = diffusion_signature
+                        diffusion_batch_results = {}
+                        diffusion_batcher = self._make_diffusion_batcher(model, args)
+                        unprocessed_requests.append((rqueue, request, args))
+                        continue
+                    else:
+                        drain_diffusion_batch = True
+                        unprocessed_requests.append((rqueue, request, args))
+                        continue
+
+                if diffusion_batcher is not None:
+                    drain_diffusion_batch = True
+                    unprocessed_requests.append((rqueue, request, args))
+                    continue
 
                 # Can it be added to the current batch?
                 if (
@@ -834,6 +1056,45 @@ class ResponseGenerator:
                     drain_batch = True
                     unprocessed_requests.append((rqueue, request, args))
                     continue
+
+            # No request so serve from the current diffusion batch
+            elif diffusion_batcher is not None:
+                if len(diffusion_batch_results) == 0:
+                    if drain_diffusion_batch:
+                        current_model = None
+                        current_tokenizer = None
+                        current_model_key = None
+                        current_diffusion_signature = None
+                        diffusion_batcher = None
+                        drain_diffusion_batch = False
+                    continue
+
+                active_results = diffusion_batch_results
+
+                def diffusion_progress(update):
+                    total = update["num_blocks"] * update["block_steps"]
+                    processed = (
+                        update["block_index"] * update["block_steps"]
+                        + update["step_index"]
+                        + 1
+                    )
+                    for result in active_results.values():
+                        result["rqueue"].put((processed, total))
+
+                drained = diffusion_batcher.drain(
+                    current_tokenizer,
+                    max_batch_size=self.cli_args.decode_concurrency,
+                    progress_callback=diffusion_progress,
+                    verbose=False,
+                )
+                for uid, result in list(active_results.items()):
+                    drained_result = drained.get(uid)
+                    if drained_result is None:
+                        continue
+                    self._emit_diffusion_text(
+                        result["rqueue"], current_tokenizer, drained_result["text"]
+                    )
+                    del diffusion_batch_results[uid]
 
             # No request so serve from the current batch
             elif batch_generator is not None:
@@ -972,48 +1233,75 @@ class ResponseGenerator:
                 if self.model_provider.draft_model is not None:
                     cache += make_prompt_cache(self.model_provider.draft_model)
 
-            # Process the prompt and generate tokens
-            for gen in stream_generate(
-                model=model,
-                tokenizer=tokenizer,
-                prompt=rest,
-                max_tokens=args.max_tokens,
-                sampler=sampler,
-                logits_processors=logits_processors,
-                prompt_cache=cache,
-                draft_model=draft_model,
-                num_draft_tokens=args.num_draft_tokens,
-                prompt_progress_callback=progress,
-                prefill_step_size=self.cli_args.prefill_step_size,
-            ):
-                finish_reason = gen.finish_reason
-                sm_state, match_sequence, current_state = sm.match(sm_state, gen.token)
-                if match_sequence is not None and current_state is None:
-                    finish_reason = "stop"
-                rqueue.put(
-                    Response(
-                        gen.text,
-                        gen.token,
-                        current_state,
-                        match_sequence,
-                        gen.logprobs[gen.token].item(),
-                        finish_reason,
-                        _format_top_logprobs(
-                            gen.logprobs, args.top_logprobs, tokenizer
-                        ),
-                    )
+            if args.diffusion and args.diffusion.get("enabled", False):
+                def diffusion_progress(update):
+                    total = args.diffusion.get("steps", args.max_tokens)
+                    processed = update["block_index"] * update["block_steps"] + update["step_index"] + 1
+                    progress(processed, total)
+
+                result = llada_generate(
+                    model,
+                    tokenizer,
+                    rest,
+                    mode=args.diffusion.get("mode", "faithful_llada"),
+                    steps=args.diffusion.get("steps", args.max_tokens),
+                    gen_length=args.diffusion.get("gen_length", args.max_tokens),
+                    block_length=args.diffusion.get(
+                        "block_length", args.diffusion.get("gen_length", args.max_tokens)
+                    ),
+                    temperature=args.sampling.temperature,
+                    cfg_scale=args.diffusion.get("cfg_scale", 0.0),
+                    compile_steps=args.diffusion.get("compile_steps", True),
+                    block_local=args.diffusion.get("block_local", False),
+                    dynamic_batching=args.diffusion.get("dynamic_batching", True),
+                    progress_callback=diffusion_progress,
                 )
-                cache_key.append(gen.token)
+                output_text = result.text[0] if isinstance(result.text, list) else result.text
+                self._emit_diffusion_text(rqueue, tokenizer, output_text)
+            else:
+                # Process the prompt and generate tokens
+                for gen in stream_generate(
+                    model=model,
+                    tokenizer=tokenizer,
+                    prompt=rest,
+                    max_tokens=args.max_tokens,
+                    sampler=sampler,
+                    logits_processors=logits_processors,
+                    prompt_cache=cache,
+                    draft_model=draft_model,
+                    num_draft_tokens=args.num_draft_tokens,
+                    prompt_progress_callback=progress,
+                    prefill_step_size=self.cli_args.prefill_step_size,
+                ):
+                    finish_reason = gen.finish_reason
+                    sm_state, match_sequence, current_state = sm.match(sm_state, gen.token)
+                    if match_sequence is not None and current_state is None:
+                        finish_reason = "stop"
+                    rqueue.put(
+                        Response(
+                            gen.text,
+                            gen.token,
+                            current_state,
+                            match_sequence,
+                            gen.logprobs[gen.token].item(),
+                            finish_reason,
+                            _format_top_logprobs(
+                                gen.logprobs, args.top_logprobs, tokenizer
+                            ),
+                        )
+                    )
+                    cache_key.append(gen.token)
 
-                if ctx._should_stop:
-                    if self._is_distributed:
-                        raise NotImplementedError()
-                    break
+                    if ctx._should_stop:
+                        if self._is_distributed:
+                            raise NotImplementedError()
+                        break
 
-                if finish_reason is not None:
-                    break
+                    if finish_reason is not None:
+                        break
 
-            rqueue.put(None)
+            if not (args.diffusion and args.diffusion.get("enabled", False)):
+                rqueue.put(None)
 
             # Save the KV cache again
             self.prompt_cache.insert_cache(
@@ -1190,6 +1478,7 @@ class APIHandler(BaseHTTPRequestHandler):
         self.top_logprobs = self.body.get("top_logprobs", -1)
         self.seed = self.body.get("seed", None)
         self.chat_template_kwargs = self.body.get("chat_template_kwargs")
+        self.diffusion = self.body.get("diffusion", None)
         self.validate_model_parameters()
 
         # Get stop sequences
@@ -1249,6 +1538,7 @@ class APIHandler(BaseHTTPRequestHandler):
         self._validate("adapter", str, optional=True)
         self._validate("seed", int, optional=True)
         self._validate("logit_bias", dict, optional=True)
+        self._validate("diffusion", dict, optional=True)
 
         if self.logit_bias is not None:
             try:
@@ -1403,6 +1693,7 @@ class APIHandler(BaseHTTPRequestHandler):
             top_logprobs=self.top_logprobs,
             seed=self.seed,
             chat_template_kwargs=self.chat_template_kwargs,
+            diffusion=self.diffusion,
         )
 
         # Keep connection allive during long prompt processing (and also log

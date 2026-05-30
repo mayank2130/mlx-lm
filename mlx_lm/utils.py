@@ -420,6 +420,66 @@ def load_model(
     return model, config
 
 
+def _warmup_loaded_model(
+    model: nn.Module,
+    config: Dict[str, Any],
+    *,
+    warmup_config: Optional[Dict[str, Any]] = None,
+):
+    warmup_config = warmup_config or {}
+    max_sequence_length = (
+        warmup_config.get("sequence_length")
+        or config.get("max_sequence_length")
+        or config.get("max_position_embeddings")
+        or 32
+    )
+    sequence_length = min(int(max_sequence_length), warmup_config.get("max_tokens", 32))
+    batch_size = int(warmup_config.get("batch_size", 1))
+    dtype = warmup_config.get("dtype", mx.int32)
+    vocab_size = (
+        config.get("vocab_size")
+        or config.get("embedding_size")
+        or config.get("text_config", {}).get("vocab_size")
+        or 32000
+    )
+    input_ids = mx.zeros((batch_size, sequence_length), dtype=dtype)
+    if vocab_size > 1:
+        input_ids[:, 0] = 1
+    attention_mask = mx.ones((batch_size, sequence_length), dtype=mx.int32)
+
+    mx.eval(model.parameters())
+
+    if getattr(model, "supports_block_local", False) and hasattr(model, "transformer"):
+        block_length = min(int(warmup_config.get("block_length", 8)), sequence_length)
+        block_start = max(sequence_length - block_length, 0)
+        prefix_states = model.transformer.prefill_prefix_states(
+            input_ids,
+            prefix_length=block_start,
+            attention_mask=attention_mask,
+        )
+        logits = model(
+            input_ids,
+            attention_mask=attention_mask,
+            block_range=(block_start, sequence_length),
+            prefix_states=prefix_states,
+        )
+        mx.eval(logits)
+        return
+
+    kwargs = {}
+    if getattr(model, "supports_logits_range", False):
+        warmup_width = min(int(warmup_config.get("logits_width", 8)), sequence_length)
+        kwargs["logits_range"] = (sequence_length - warmup_width, sequence_length)
+    elif "last_logits_only" in inspect.signature(model.__call__).parameters:
+        kwargs["last_logits_only"] = True
+
+    try:
+        logits = model(input_ids, attention_mask=attention_mask, **kwargs)
+    except TypeError:
+        logits = model(input_ids, **kwargs)
+    mx.eval(logits)
+
+
 def load_adapters(model: nn.Module, adapter_path: str) -> nn.Module:
     from .tuner.utils import load_adapters as _load_adapters
 
@@ -456,6 +516,8 @@ def load(
     model_config: Optional[Dict[str, Any]] = None,
     adapter_path: Optional[str] = None,
     lazy: bool = False,
+    warmup: bool = False,
+    warmup_config: Optional[Dict[str, Any]] = None,
     return_config: bool = False,
     revision: Optional[str] = None,
 ) -> Union[
@@ -476,6 +538,12 @@ def load(
         lazy (bool): If ``False`` eval the model parameters to make sure they are
             loaded in memory before returning, otherwise they will be loaded
             when needed. Default: ``False``
+        warmup (bool): If ``True`` aggressively materialize model weights and run
+            a small forward pass before returning. Useful for diffusion models and
+            for cleaner first-token / first-step latency measurements.
+        warmup_config (dict, optional): Optional overrides for the warmup pass,
+            such as ``sequence_length``, ``block_length``, ``logits_width``,
+            ``max_tokens``, and ``batch_size``.
         return_config (bool: If ``True`` return the model config as the last item..
         revision (str, optional): A revision id which can be a branch name, a tag, or a commit hash.
     Returns:
@@ -495,6 +563,9 @@ def load(
     tokenizer = load_tokenizer(
         model_path, tokenizer_config, eos_token_ids=config.get("eos_token_id", None)
     )
+
+    if warmup:
+        _warmup_loaded_model(model, config, warmup_config=warmup_config)
 
     if return_config:
         return model, tokenizer, config
