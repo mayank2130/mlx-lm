@@ -17,23 +17,20 @@
 		Trash2
 	} from '@lucide/svelte';
 	import { Button } from '$lib/components/ui/button';
-	import {
-		Dialog,
-		DialogContent,
-		DialogDescription,
-		DialogFooter,
-		DialogHeader,
-		DialogTitle
-	} from '$lib/components/ui/dialog';
-	import { Input } from '$lib/components/ui/input';
 	import { Select, SelectContent, SelectItem, SelectTrigger } from '$lib/components/ui/select';
-	import { Separator } from '$lib/components/ui/separator';
 	import {
 		ChatPersistence,
 		type MessageMeta,
 		type PersistedConversation,
 		type PersistedMessage
 	} from '$lib/stores/database';
+	import { toolsStore } from '$lib/stores/tools.svelte';
+	import {
+		buildApiMessages,
+		consumeChatCompletionStream,
+		invokeToolCall
+	} from '$lib/chat/tool-loop';
+	import type { ToolCall } from '$lib/types';
 	import { cn } from '$lib/utils';
 
 	type ModelRecord = {
@@ -71,7 +68,6 @@
 	let isAutoScrolling = false;
 	const scrollStickThreshold = 80;
 	let sidebarExpanded = $state(false);
-	let settingsOpen = $state(false);
 	let modelPickerOpen = $state(false);
 	let modelPickerStyle = $state('');
 	let modelTriggerEl = $state<HTMLButtonElement | null>(null);
@@ -88,6 +84,8 @@
 	let chatTitle = $derived(activeConversation?.name || 'MLX Chat');
 
 	onMount(() => {
+		toolsStore.initialize();
+
 		void (async () => {
 			const storedSettings = ChatPersistence.getUiSettings();
 			if (storedSettings.selectedModel) {
@@ -441,43 +439,127 @@
 		await scrollToBottom({ force: true });
 
 		const startedAt = performance.now();
+		const enabledTools = toolsStore.enabledToolDefinitions;
+		let apiMessages = buildApiMessages(messages.slice(0, -1));
+		let activeAssistantId = assistantMessage.id;
+		const maxToolRounds = 8;
+
+		const appendToActiveAssistant = (fragment: string) => {
+			messages = messages.map((message) =>
+				message.id === activeAssistantId
+					? {
+							...message,
+							content: `${message.content}${fragment}`
+						}
+					: message
+			);
+			if (activeConversationId) {
+				const active = messages.find((message) => message.id === activeAssistantId);
+				if (active) {
+					void ChatPersistence.updateMessage(activeAssistantId, {
+						content: active.content
+					});
+				}
+			}
+			schedulePersistActiveConversation();
+		};
 
 		try {
-			const response = await fetch('/api/chat', {
-				method: 'POST',
-				headers: {
-					'content-type': 'application/json'
-				},
-				body: JSON.stringify({
-					model: selectedModel,
-					messages: [
-						...conversationHistory,
-						{ role: userMessage.role, content: userMessage.content }
-					],
-					max_tokens: maxTokens,
-					temperature
-				})
-			});
+			for (let round = 0; round < maxToolRounds; round += 1) {
+				const response = await fetch('/api/chat', {
+					method: 'POST',
+					headers: {
+						'content-type': 'application/json'
+					},
+					body: JSON.stringify({
+						model: selectedModel,
+						messages: apiMessages,
+						max_tokens: maxTokens,
+						temperature,
+						tools: enabledTools.length > 0 ? enabledTools : undefined,
+						stream: true
+					})
+				});
 
-			if (!response.ok || !response.body) {
-				const payload = await response.json().catch(() => null);
-				throw new Error(payload?.details || payload?.error || 'Streaming request failed');
+				if (!response.ok || !response.body) {
+					const payload = await response.json().catch(() => null);
+					throw new Error(payload?.details || payload?.error || 'Streaming request failed');
+				}
+
+				const result = await consumeChatCompletionStream(response.body, appendToActiveAssistant);
+
+				const hasToolCalls =
+					result.toolCalls.length > 0 || result.finishReason === 'tool_calls';
+
+				if (!hasToolCalls) {
+					break;
+				}
+
+				updateAssistantToolCalls(activeAssistantId, result.toolCalls);
+
+				apiMessages = [
+					...apiMessages,
+					{
+						role: 'assistant',
+						content: result.content,
+						tool_calls: result.toolCalls
+					}
+				];
+
+				for (const toolCall of result.toolCalls) {
+					const toolContent = await invokeToolCall(toolCall);
+					const toolMessage: ChatMessage = {
+						id: nextId(),
+						role: 'tool',
+						content: toolContent,
+						toolName: toolCall.function.name,
+						toolCallId: toolCall.id,
+						createdAt: Date.now()
+					};
+					messages = [...messages, toolMessage];
+					await persistMessage(toolMessage);
+					apiMessages = [
+						...apiMessages,
+						{
+							role: 'tool',
+							name: toolCall.function.name,
+							tool_call_id: toolCall.id,
+							content: toolContent
+						}
+					];
+				}
+
+				if (round + 1 >= maxToolRounds) {
+					throw new Error('Tool loop exceeded maximum rounds');
+				}
+
+				const nextAssistant: ChatMessage = {
+					id: nextId(),
+					role: 'assistant',
+					content: '',
+					createdAt: Date.now()
+				};
+				activeAssistantId = nextAssistant.id;
+				messages = [...messages, nextAssistant];
+				await persistMessage(nextAssistant);
+				await scrollToBottom({ force: true });
 			}
 
-			await consumeEventStream(response.body);
-
 			const durationMs = performance.now() - startedAt;
-			const content = messages.at(-1)?.content ?? '';
+			const lastAssistant = messages.findLast((message) => message.role === 'assistant');
+			const content = lastAssistant?.content ?? '';
 			const tokens = estimateTokens(content);
-			finalizeLastAssistantMessage({
-				model: selectedModel,
-				tokens,
-				durationMs,
-				tokensPerSecond: tokens / (durationMs / 1000)
-			});
+			if (lastAssistant) {
+				finalizeAssistantMessage(lastAssistant.id, {
+					model: selectedModel,
+					tokens,
+					durationMs,
+					tokensPerSecond: tokens / (durationMs / 1000)
+				});
+			}
 		} catch (error) {
 			streamError = error instanceof Error ? error.message : 'Streaming request failed';
-			updateLastAssistantMessage(`\n\n[error] ${streamError}`);
+			appendToActiveAssistant(`\n\n[error] ${streamError}`);
 		} finally {
 			isStreaming = false;
 			await persistActiveConversation();
@@ -487,78 +569,22 @@
 		}
 	}
 
-	async function consumeEventStream(stream: ReadableStream<Uint8Array>) {
-		const reader = stream.getReader();
-		const decoder = new TextDecoder();
-		let buffer = '';
-
-		while (true) {
-			const { value, done } = await reader.read();
-			if (done) {
-				break;
-			}
-
-			buffer += decoder.decode(value, { stream: true });
-			const events = buffer.split('\n\n');
-			buffer = events.pop() || '';
-
-			for (const event of events) {
-				for (const line of event.split('\n')) {
-					if (!line.startsWith('data: ')) {
-						continue;
-					}
-
-					const data = line.slice(6).trim();
-					if (data === '[DONE]') {
-						return;
-					}
-
-					const payload = JSON.parse(data);
-					const delta = payload?.choices?.[0]?.delta;
-					const content = delta?.content;
-
-					if (typeof content === 'string' && content.length > 0) {
-						updateLastAssistantMessage(content);
-					}
-				}
-			}
-		}
-	}
-
-	function updateLastAssistantMessage(fragment: string) {
-		const lastIndex = messages.length - 1;
-		if (lastIndex < 0 || messages[lastIndex]?.role !== 'assistant') {
-			return;
-		}
-
-		const nextContent = `${messages[lastIndex].content}${fragment}`;
-		messages = messages.map((message, index) =>
-			index === lastIndex
-				? {
-						...message,
-						content: nextContent
-					}
-				: message
+	function updateAssistantToolCalls(messageId: string, toolCalls: ToolCall[]) {
+		messages = messages.map((message) =>
+			message.id === messageId ? { ...message, toolCalls } : message
 		);
 		if (activeConversationId) {
-			void ChatPersistence.updateMessage(messages[lastIndex].id, {
-				content: nextContent
-			});
+			void ChatPersistence.updateMessage(messageId, { toolCalls });
 		}
 		schedulePersistActiveConversation();
 	}
 
-	function finalizeLastAssistantMessage(meta: MessageMeta) {
-		const lastIndex = messages.length - 1;
-		if (lastIndex < 0 || messages[lastIndex]?.role !== 'assistant') {
-			return;
-		}
-
-		messages = messages.map((message, index) =>
-			index === lastIndex ? { ...message, meta } : message
+	function finalizeAssistantMessage(messageId: string, meta: MessageMeta) {
+		messages = messages.map((message) =>
+			message.id === messageId ? { ...message, meta } : message
 		);
 		if (activeConversationId) {
-			void ChatPersistence.updateMessage(messages[lastIndex].id, { meta });
+			void ChatPersistence.updateMessage(messageId, { meta });
 		}
 		schedulePersistActiveConversation();
 	}
@@ -862,7 +888,7 @@
 					'text-sidebar-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground',
 					sidebarExpanded && 'w-full justify-start gap-2 px-2'
 				)}
-				onclick={() => (settingsOpen = true)}
+				href="/settings"
 				aria-label="Settings"
 			>
 				<Settings class="size-4 shrink-0" />
@@ -943,8 +969,30 @@
 									</Button>
 								</div>
 							</div>
+						{:else if message.role === 'tool'}
+							<div
+								class="rounded-xl border border-border/70 bg-muted/30 px-4 py-3 text-sm text-muted-foreground"
+							>
+								<p class="mb-2 text-xs font-medium tracking-wide text-foreground uppercase">
+									Tool result · {message.toolName}
+								</p>
+								<pre
+									class="max-h-64 overflow-auto whitespace-pre-wrap break-words text-[13px] leading-relaxed"
+								>{message.content}</pre>
+							</div>
 						{:else}
 							<div class="flex flex-col gap-3">
+								{#if message.toolCalls?.length}
+									<div class="flex flex-wrap gap-2">
+										{#each message.toolCalls as toolCall (toolCall.id)}
+											<span
+												class="rounded-full border border-border bg-muted/60 px-2.5 py-1 text-xs text-muted-foreground"
+											>
+												Calling {toolCall.function.name}
+											</span>
+										{/each}
+									</div>
+								{/if}
 								<div class="text-[15px] leading-relaxed text-foreground">
 									<p class="break-words whitespace-pre-wrap">
 										{message.content || (isStreaming ? '…' : '')}
@@ -1168,73 +1216,3 @@
 		{/each}
 	</ul>
 {/if}
-
-<Dialog bind:open={settingsOpen}>
-	<DialogContent class="border-border/80 bg-card sm:max-w-md">
-		<DialogHeader>
-			<DialogTitle>Settings</DialogTitle>
-			<DialogDescription>Generation options for the MLX server proxy.</DialogDescription>
-		</DialogHeader>
-
-		<div class="space-y-4 py-2">
-			<div class="space-y-2">
-				<label class="text-sm font-medium" for="settings-model">Default model</label>
-				<Select type="single" bind:value={selectedModel}>
-					<SelectTrigger id="settings-model" class="w-full">
-						<span class="truncate">{selectedModel}</span>
-					</SelectTrigger>
-					<SelectContent class="max-h-[300px]">
-						{#each models as model (model)}
-							<SelectItem value={model} label={model}>{model}</SelectItem>
-						{/each}
-					</SelectContent>
-				</Select>
-			</div>
-
-			<div class="grid grid-cols-2 gap-3">
-				<div class="space-y-2">
-					<label class="text-sm font-medium" for="settings-temperature">Temperature</label>
-					<Input
-						id="settings-temperature"
-						type="number"
-						min="0"
-						max="2"
-						step="0.1"
-						bind:value={temperature}
-					/>
-				</div>
-				<div class="space-y-2">
-					<label class="text-sm font-medium" for="settings-max-tokens">Max tokens</label>
-					<Input
-						id="settings-max-tokens"
-						type="number"
-						min="1"
-						max="4096"
-						step="1"
-						bind:value={maxTokens}
-					/>
-				</div>
-			</div>
-
-			<p class="text-xs text-muted-foreground">
-				The values here are also available next to the send button for quick edits.
-			</p>
-
-			<Separator />
-
-			<div class="space-y-1 text-sm text-muted-foreground">
-				<p><span class="font-medium text-foreground">GET</span> /api/models</p>
-				<p><span class="font-medium text-foreground">POST</span> /api/chat</p>
-			</div>
-		</div>
-
-		<DialogFooter>
-			<Button variant="outline" onclick={loadModels} disabled={isLoadingModels}>
-				{#if isLoadingModels}
-					<LoaderCircle class="size-4 animate-spin" />
-				{/if}
-				Refresh models
-			</Button>
-		</DialogFooter>
-	</DialogContent>
-</Dialog>

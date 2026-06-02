@@ -1102,6 +1102,10 @@ class APIHandler(BaseHTTPRequestHandler):
         """
         Respond to a POST request from a client.
         """
+        if self.path == "/tools":
+            self.handle_tools_post()
+            return
+
         request_factories = {
             "/v1/completions": self.handle_text_completions,
             "/v1/chat/completions": self.handle_chat_completions,
@@ -1621,7 +1625,9 @@ class APIHandler(BaseHTTPRequestHandler):
         """
         Respond to a GET request from a client.
         """
-        if self.path.startswith("/v1/models"):
+        if self.path == "/tools":
+            self.handle_tools_get()
+        elif self.path.startswith("/v1/models"):
             self.handle_models_request()
         elif self.path == "/health":
             self.handle_health_check()
@@ -1629,6 +1635,62 @@ class APIHandler(BaseHTTPRequestHandler):
             self._set_completion_headers(404)
             self.end_headers()
             self.wfile.write(b"Not Found")
+
+    def handle_tools_get(self):
+        server_tools = self.response_generator.cli_args.server_tools
+        if server_tools is None:
+            self._set_completion_headers(404)
+            self.end_headers()
+            self.wfile.write(
+                json.dumps(
+                    {
+                        "error": "Server tools are disabled. Restart with --tools."
+                    }
+                ).encode()
+            )
+            return
+
+        from mlx_lm.server_builtin_tools import _load_module
+
+        req = _load_module().ServerHttpReq()
+        res = server_tools.handle_get(req)
+        self._set_completion_headers(res.status)
+        self.end_headers()
+        self.wfile.write(res.data.encode())
+        self.wfile.flush()
+
+    def handle_tools_post(self):
+        server_tools = self.response_generator.cli_args.server_tools
+        if server_tools is None:
+            self._set_completion_headers(404)
+            self.end_headers()
+            self.wfile.write(
+                json.dumps(
+                    {
+                        "error": "Server tools are disabled. Restart with --tools."
+                    }
+                ).encode()
+            )
+            return
+
+        content_length = self.headers.get("Content-Length")
+        if content_length is None:
+            self._set_completion_headers(411)
+            self.end_headers()
+            self.wfile.write(
+                json.dumps({"error": "Content-Length header is required"}).encode()
+            )
+            return
+
+        raw_body = self.rfile.read(int(content_length))
+        from mlx_lm.server_builtin_tools import _load_module
+
+        req = _load_module().ServerHttpReq(body=raw_body.decode())
+        res = server_tools.handle_post(req)
+        self._set_completion_headers(res.status)
+        self.end_headers()
+        self.wfile.write(res.data.encode())
+        self.wfile.flush()
 
     def handle_health_check(self):
         """
@@ -1884,6 +1946,17 @@ def main():
         action="store_true",
         help="Use pipelining instead of tensor parallelism",
     )
+    parser.add_argument(
+        "--tools",
+        action="store_true",
+        help="Enable built-in server tools at GET/POST /tools",
+    )
+    parser.add_argument(
+        "--tool",
+        action="append",
+        default=None,
+        help="Enable specific built-in tools (repeatable). Use 'all' for every tool.",
+    )
     args = parser.parse_args()
     if mx.metal.is_available():
         wired_limit = mx.device_info()["max_recommended_working_set_size"]
@@ -1893,6 +1966,15 @@ def main():
         level=getattr(logging, args.log_level.upper(), None),
         format="%(asctime)s - %(levelname)s - %(message)s",
     )
+
+    if args.tools:
+        from mlx_lm.server_builtin_tools import create_server_tools
+
+        args.server_tools = create_server_tools(args.tool)
+        logging.info("Built-in server tools enabled at /tools")
+    else:
+        args.server_tools = None
+
     run(args.host, args.port, ModelProvider(args))
 
 
